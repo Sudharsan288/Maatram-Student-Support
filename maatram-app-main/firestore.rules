@@ -1,0 +1,131 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function roleExists() { return signedIn() && exists(/databases/$(database)/documents/roles/$(request.auth.uid)); }
+    function currentRole() { return get(/databases/$(database)/documents/roles/$(request.auth.uid)).data.role; }
+    function hasRole(roleName) { return roleExists() && currentRole() == roleName; }
+    function isAdmin() { return hasRole('admin'); }
+    function isCoordinator() { return hasRole('coordinator'); }
+    function validRole(roleName) { return roleName in ['student', 'coordinator', 'admin']; }
+
+    match /roles/{userId} {
+      allow read: if signedIn() && (request.auth.uid == userId || isAdmin());
+      allow create: if signedIn() && request.auth.uid == userId
+        && request.resource.data.role == 'student'
+        && request.resource.data.keys().hasOnly(['role', 'createdAt']);
+      allow update: if isAdmin() && validRole(request.resource.data.role);
+      allow delete: if isAdmin() && userId != request.auth.uid;
+    }
+
+    // ---------------------------------------------------------------------
+    // COLLECTION-GROUP READ for queries. Admin and Coordinator dashboards use
+    // collectionGroup('queries'); Firestore only allows that with a recursive
+    // wildcard rule. Coordinators can only read queries assigned to them.
+    // ---------------------------------------------------------------------
+    match /{path=**}/queries/{queryId} {
+      allow read: if signedIn() && (
+        isAdmin()
+        || (isCoordinator() && resource.data.assignedTo == request.auth.uid)
+        || resource.data.studentUid == request.auth.uid);
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn() && (request.auth.uid == userId || isAdmin());
+      allow create: if signedIn() && request.auth.uid == userId
+        && request.resource.data.role == 'student'
+        && request.resource.data.keys().hasOnly(['uid','email','role','displayName','institution','phone','createdAt']);
+      allow update: if isAdmin() || (signedIn() && request.auth.uid == userId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['email','displayName','institution','phone','lastLoginAt','updatedAt']));
+      allow delete: if isAdmin() && userId != request.auth.uid;
+
+      match /queries/{queryId} {
+        function queryOwner() { return request.auth.uid == userId; }
+        allow read: if signedIn() && (queryOwner() || isAdmin()
+          || (isCoordinator() && resource.data.assignedTo == request.auth.uid));
+
+        // Student Representatives log queries for their own account.
+        // Admins may also create (used only by the "Load demo data" tool).
+        allow create: if isAdmin() || (signedIn() && queryOwner() && hasRole('student')
+          && request.resource.data.status == 'New'
+          && request.resource.data.assignedTo == ''
+          && request.resource.data.keys().hasOnly([
+            'title','category','description','studentName','institution','priority','channel',
+            'status','createdAt','lastActivityAt','studentEmail','studentPhone','loggedByEmail','studentUid','assignedTo',
+            'assignedEmail','dueAt','reminderSentAt','escalatedAt','attachmentCount'
+          ])
+          && request.resource.data.studentUid == request.auth.uid
+          && request.resource.data.title is string && request.resource.data.title.size() <= 140
+          && request.resource.data.description is string && request.resource.data.description.size() <= 4000
+          && request.resource.data.priority in ['Low','Medium','High','Urgent']);
+
+        allow update: if isAdmin()
+          // Coordinators: only workflow fields, only on queries assigned to them.
+          || (isCoordinator() && resource.data.assignedTo == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'status','statusUpdatedAt','lastActivityAt','resolvedAt','waitingForStudentAt','dueAt',
+              'reminderSentAt','escalatedAt','studentReminderCount','studentRemindedAt'
+            ]))
+          // Student Representative: may only answer a "Waiting for Student" request (-> In Progress).
+          || (signedIn() && queryOwner() && hasRole('student')
+            && resource.data.status == 'Waiting for Student'
+            && request.resource.data.status == 'In Progress'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'status','statusUpdatedAt','lastActivityAt','dueAt','reminderSentAt','escalatedAt',
+              'studentReminderCount','studentRemindedAt'
+            ]));
+        allow delete: if isAdmin();
+
+        match /history/{eventId} {
+          function parentQuery() { return get(/databases/$(database)/documents/users/$(userId)/queries/$(queryId)); }
+          function parentIsAssigned() { return isCoordinator() && parentQuery().data.assignedTo == request.auth.uid; }
+          allow read: if signedIn() && (request.auth.uid == userId || isAdmin() || parentIsAssigned());
+          allow create: if signedIn() && request.resource.data.actorUid == request.auth.uid
+            && ((request.auth.uid == userId && hasRole('student') && request.resource.data.type in ['created', 'student_reply'])
+              || isAdmin() || parentIsAssigned());
+          allow update: if false;
+          // Only demo records can be removed (so the audit trail of real queries is immutable).
+          allow delete: if isAdmin() && parentQuery().data.get('isDemo', false) == true;
+        }
+
+        match /attachments/{fileId} {
+          function parentAssigned() { return isCoordinator() && get(/databases/$(database)/documents/users/$(userId)/queries/$(queryId)).data.assignedTo == request.auth.uid; }
+          allow read: if signedIn() && (request.auth.uid == userId || isAdmin() || parentAssigned());
+          allow create: if signedIn() && ((request.auth.uid == userId && hasRole('student')) || isAdmin())
+            && request.resource.data.uploadedBy == request.auth.uid
+            && request.resource.data.keys().hasOnly(['name','type','size','dataUrl','uploadedBy','createdAt'])
+            && request.resource.data.dataUrl.size() < 900000
+            && request.resource.data.type in ['image/jpeg','image/png','image/webp','application/pdf'];
+          allow update: if false;
+          allow delete: if isAdmin();
+        }
+      }
+
+      match /notifications/{notificationId} {
+        allow read: if signedIn() && request.auth.uid == userId;
+        allow update: if signedIn() && request.auth.uid == userId
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['readAt','read']);
+        // Any signed-in team member may notify someone about a query (prototype trade-off:
+        // content is size-limited and always stamped with the sender's uid). Cloud Functions bypass these rules.
+        allow create: if signedIn() && request.resource.data.fromUid == request.auth.uid
+          && request.resource.data.read == false
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.keys().hasOnly(['type','title','message','queryId','ownerUid','read','createdAt','fromUid'])
+          && request.resource.data.message.size() <= 500
+          && request.resource.data.type in ['query_assigned','status_changed','query_resolved','student_reply','coordinator_reminder','query_escalation','student_reply_needed','unassigned_alert'];
+        allow delete: if false;
+      }
+    }
+
+    match /categories/{categoryId} {
+      allow read: if signedIn();
+      allow create, update, delete: if isAdmin();
+    }
+    // Guidelines + follow-up timings are readable by everyone signed in; assignment rules are Admin-only.
+    match /settings/{settingId} {
+      allow read: if signedIn() && (settingId in ['rules', 'followup'] || isAdmin());
+      allow create, update, delete: if isAdmin();
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}
